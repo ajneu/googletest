@@ -50,7 +50,105 @@
 
 namespace testing {
 
-MockObjectRegistry *g_mock_object_registry_ptr;
+namespace internal {
+  class UntypedFunctionMockerBase; // forward declaration
+}
+
+typedef std::set<internal::UntypedFunctionMockerBase*> FunctionMockers;
+
+// The current state of a mock object.  Such information is needed for
+// detecting leaked mock objects and explicitly verifying a mock's
+// expectations.
+struct MockObjectState {
+  MockObjectState()
+      : first_used_file(NULL), first_used_line(-1), leakable(false) {}
+
+  // Where in the source file an ON_CALL or EXPECT_CALL is first
+  // invoked on this mock object.
+  const char* first_used_file;
+  int first_used_line;
+  ::std::string first_used_test_case;
+  ::std::string first_used_test;
+  bool leakable;  // true iff it's OK to leak the object.
+  FunctionMockers function_mockers;  // All registered methods of the object.
+};
+
+// A global registry holding the state of all mock objects that are
+// alive.  A mock object is added to this registry the first time
+// Mock::AllowLeak(), ON_CALL(), or EXPECT_CALL() is called on it.  It
+// is removed from the registry in the mock object's destructor.
+class MockObjectRegistry {
+ public:
+  // Maps a mock object (identified by its address) to its state.
+  typedef std::map<const void*, MockObjectState> StateMap;
+
+  MockObjectRegistry() {
+    g_mock_object_registry_ptr = this;
+  }
+  // This destructor will be called when a program exits, after all
+  // tests in it have been run.  By then, there should be no mock
+  // object alive.  Therefore we report any living object as test
+  // failure, unless the user explicitly asked us to ignore it.
+  ~MockObjectRegistry() {
+    // "using ::std::cout;" doesn't work with Symbian's STLport, where cout is
+    // a macro.
+
+    g_mock_object_registry_ptr = 0;
+
+    if (!GMOCK_FLAG(catch_leaked_mocks))
+      return;
+
+    int leaked_count = 0;
+    for (StateMap::const_iterator it = states_.begin(); it != states_.end();
+         ++it) {
+      if (it->second.leakable)  // The user said it's fine to leak this object.
+        continue;
+
+      // TODO(wan@google.com): Print the type of the leaked object.
+      // This can help the user identify the leaked object.
+      std::cout << "\n";
+      const MockObjectState& state = it->second;
+      std::cout << internal::FormatFileLocation(state.first_used_file,
+                                                state.first_used_line);
+      std::cout << " ERROR: this mock object";
+      if (state.first_used_test != "") {
+        std::cout << " (used in test " << state.first_used_test_case << "."
+             << state.first_used_test << ")";
+      }
+      std::cout << " should be deleted but never is. Its address is @"
+           << it->first << ".\n"
+              "   If the mock happens to have static storage duration, "
+                  "it should be marked with "
+                  "::testing::Mock::AllowLeak(&my_global_mock)\n"
+              "   and its expectations explicitly verified, e.g. with "
+                  "Mock::VerifyAndClearExpectations(&my_global_mock);";
+      leaked_count++;
+    }
+    if (leaked_count > 0) {
+      std::cout << "\nERROR: " << leaked_count
+           << " leaked mock " << (leaked_count == 1 ? "object" : "objects")
+           << " found at program exit.\n";
+      std::cout.flush();
+      ::std::cerr.flush();
+      // RUN_ALL_TESTS() has already returned when this destructor is
+      // called.  Therefore we cannot use the normal Google Test
+      // failure reporting mechanism.
+      _exit(1);  // We cannot call exit() as it is not reentrant and
+                 // may already have been called.
+    }
+  }
+
+  StateMap& states() { return states_; }
+
+ private:
+  StateMap states_;
+
+private:
+  friend class internal::UntypedFunctionMockerBase;
+  static MockObjectRegistry *g_mock_object_registry_ptr;
+};
+
+MockObjectRegistry *MockObjectRegistry::g_mock_object_registry_ptr;
 
 namespace internal {
 
@@ -271,7 +369,7 @@ void ReportUninterestingCall(CallReaction reaction, const string& msg) {
 }
 
 UntypedFunctionMockerBase::UntypedFunctionMockerBase()
-    : mock_obj_(NULL), name_(""), g_mock_object_registry_p(g_mock_object_registry_ptr) {}
+    : mock_obj_(NULL), name_(""), g_mock_object_registry_p(testing::MockObjectRegistry::g_mock_object_registry_ptr) {}
 
 UntypedFunctionMockerBase::~UntypedFunctionMockerBase() {}
 
@@ -513,98 +611,6 @@ bool UntypedFunctionMockerBase::VerifyAndClearExpectationsLocked()
 }
 
 }  // namespace internal
-
-
-typedef std::set<internal::UntypedFunctionMockerBase*> FunctionMockers;
-
-// The current state of a mock object.  Such information is needed for
-// detecting leaked mock objects and explicitly verifying a mock's
-// expectations.
-struct MockObjectState {
-  MockObjectState()
-      : first_used_file(NULL), first_used_line(-1), leakable(false) {}
-
-  // Where in the source file an ON_CALL or EXPECT_CALL is first
-  // invoked on this mock object.
-  const char* first_used_file;
-  int first_used_line;
-  ::std::string first_used_test_case;
-  ::std::string first_used_test;
-  bool leakable;  // true iff it's OK to leak the object.
-  FunctionMockers function_mockers;  // All registered methods of the object.
-};
-
-// A global registry holding the state of all mock objects that are
-// alive.  A mock object is added to this registry the first time
-// Mock::AllowLeak(), ON_CALL(), or EXPECT_CALL() is called on it.  It
-// is removed from the registry in the mock object's destructor.
-class MockObjectRegistry {
- public:
-  // Maps a mock object (identified by its address) to its state.
-  typedef std::map<const void*, MockObjectState> StateMap;
-
-  MockObjectRegistry() {
-    g_mock_object_registry_ptr = this;
-  }
-  // This destructor will be called when a program exits, after all
-  // tests in it have been run.  By then, there should be no mock
-  // object alive.  Therefore we report any living object as test
-  // failure, unless the user explicitly asked us to ignore it.
-  ~MockObjectRegistry() {
-    // "using ::std::cout;" doesn't work with Symbian's STLport, where cout is
-    // a macro.
-
-    g_mock_object_registry_ptr = 0;
-
-    if (!GMOCK_FLAG(catch_leaked_mocks))
-      return;
-
-    int leaked_count = 0;
-    for (StateMap::const_iterator it = states_.begin(); it != states_.end();
-         ++it) {
-      if (it->second.leakable)  // The user said it's fine to leak this object.
-        continue;
-
-      // TODO(wan@google.com): Print the type of the leaked object.
-      // This can help the user identify the leaked object.
-      std::cout << "\n";
-      const MockObjectState& state = it->second;
-      std::cout << internal::FormatFileLocation(state.first_used_file,
-                                                state.first_used_line);
-      std::cout << " ERROR: this mock object";
-      if (state.first_used_test != "") {
-        std::cout << " (used in test " << state.first_used_test_case << "."
-             << state.first_used_test << ")";
-      }
-      std::cout << " should be deleted but never is. Its address is @"
-           << it->first << ".\n"
-              "   If the mock happens to have static storage duration, "
-                  "it should be marked with "
-                  "::testing::Mock::AllowLeak(&my_global_mock)\n"
-              "   and its expectations explicitly verified, e.g. with "
-                  "Mock::VerifyAndClearExpectations(&my_global_mock);";
-      leaked_count++;
-    }
-    if (leaked_count > 0) {
-      std::cout << "\nERROR: " << leaked_count
-           << " leaked mock " << (leaked_count == 1 ? "object" : "objects")
-           << " found at program exit.\n";
-      std::cout.flush();
-      ::std::cerr.flush();
-      // RUN_ALL_TESTS() has already returned when this destructor is
-      // called.  Therefore we cannot use the normal Google Test
-      // failure reporting mechanism.
-      _exit(1);  // We cannot call exit() as it is not reentrant and
-                 // may already have been called.
-    }
-  }
-
-  StateMap& states() { return states_; }
-
- private:
-  StateMap states_;
-};
-
 
 // Class Mock.
 
